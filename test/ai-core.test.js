@@ -10,7 +10,6 @@ import {
   DEFAULT_CHAT_DRAW_PROMPT,
   dispatchTaggedChatResponse,
   parseChatDrawTags,
-  stripChatDrawTagsFromHistory,
 } from "../src/ai/chatDrawTags.js";
 import {
   formatLastChatDraw,
@@ -491,19 +490,17 @@ test("RP 绘图标签从正文隐藏、支持多角色，并且同一轮最多�
   assert.deepEqual(truncated.prompts, ["1girl, smile, cozy bedroom"]);
   assert.deepEqual(truncated.rawPrompts, ["1girl\nsmile, cozy bedroom"]);
 
+  const historyWithDrawTags = [
+    { role: "user", parts: [{ text: "看看现在" }] },
+    {
+      role: "model",
+      parts: [{ text: "正文\n<draw>1girl, waving</draw>" }],
+    },
+  ];
   assert.deepEqual(
-    stripChatDrawTagsFromHistory([
-      { role: "user", parts: [{ text: "看看现在" }] },
-      {
-        role: "model",
-        parts: [{ text: "正文\n<draw>1girl, waving</draw>" }],
-      },
-      { role: "model", parts: [{ text: "<draw>1girl</draw>" }] },
-    ]),
-    [
-      { role: "user", parts: [{ text: "看看现在" }] },
-      { role: "model", parts: [{ text: "正文" }] },
-    ]
+    sanitizeConversationHistory(historyWithDrawTags),
+    historyWithDrawTags,
+    "隐藏绘图标签应保留在模型历史中供后续回合参考"
   );
 
   const drawState = { scheduled: false };
@@ -693,7 +690,7 @@ test("历史回退和篡改按对话轮次与 AI 回复定位", () => {
   assert.equal(changed.history.at(-1).parts[0].text, "新回答3");
 });
 
-test("短期历史只保留用户与角色可见文字，并按轮次裁剪", () => {
+test("短期历史保留用户与角色文本（含隐藏绘图标签）并按轮次裁剪", () => {
   const legacy = [
     {
       role: "user",

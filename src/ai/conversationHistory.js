@@ -26,8 +26,8 @@ export function getConversationHistoryKey(ctx, profileName) {
 
 /**
  * The Redis history is intentionally text-only. This also migrates old stored
- * tool exchanges and Base64 image parts by dropping everything except visible
- * user/model text.
+ * tool exchanges and Base64 image parts by dropping non-text payloads. Textual
+ * model metadata such as hidden <draw> tags remains part of conversation context.
  */
 export function sanitizeConversationHistory(history = []) {
   if (!Array.isArray(history)) return [];

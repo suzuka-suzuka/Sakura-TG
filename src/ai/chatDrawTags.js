@@ -97,20 +97,6 @@ export function parseChatDrawTags(message) {
   return { text, prompts, rawPrompts };
 }
 
-/** Remove backend-only draw metadata before model replies enter Redis history. */
-export function stripChatDrawTagsFromHistory(history = []) {
-  if (!Array.isArray(history)) return [];
-  return history.flatMap((item) => {
-    if (item?.role !== "model" || !Array.isArray(item.parts)) return [item];
-    const parts = item.parts.flatMap((part) => {
-      if (typeof part?.text !== "string") return [part];
-      const text = parseChatDrawTags(part.text).text;
-      return text ? [{ ...part, text }] : [];
-    });
-    return parts.length > 0 ? [{ ...item, parts }] : [];
-  });
-}
-
 /**
  * Start drawing before the tag-free Telegram reply is awaited. The returned
  * drawTask intentionally remains in the background; callers may attach

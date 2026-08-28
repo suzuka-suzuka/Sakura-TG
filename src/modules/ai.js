@@ -2,10 +2,7 @@ import Config from "../config.js";
 import { logger } from "../logger.js";
 import { sendImageBuffer } from "../lib/sendImage.js";
 import { masterOnly } from "../middleware/auth.js";
-import {
-  dispatchTaggedChatResponse,
-  stripChatDrawTagsFromHistory,
-} from "../ai/chatDrawTags.js";
+import { dispatchTaggedChatResponse } from "../ai/chatDrawTags.js";
 import {
   formatLastChatDraw,
   loadLastChatDraw,
@@ -201,11 +198,9 @@ async function executeChat(ctx, profile, rawQuery) {
       });
 
       if (profile.history) {
-        await saveConversationHistory(
-          ctx,
-          stripChatDrawTagsFromHistory(result.history),
-          historyName
-        );
+        // 保留模型原始 <draw> 标签作为对话连续性的一部分；
+        // 标签只在发送 Telegram 可见正文时隐藏。
+        await saveConversationHistory(ctx, result.history, historyName);
       }
       if (result.status === "model_error") {
         await ctx.reply(result.error);

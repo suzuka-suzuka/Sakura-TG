@@ -1,0 +1,11 @@
+node_modules/
+logs/
+*.log
+
+# 真实配置不入库，只保留 example
+config/config.yaml
+
+# 临时/缓存产物
+temp/
+data/
+.DS_Store

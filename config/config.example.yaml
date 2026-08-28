@@ -1,0 +1,139 @@
+logLevel: info
+
+telegram:
+  token: ''
+  apiRoot: https://api.telegram.org
+  # 私聊 Bot 发送 /id 获取数字 ID。
+  masters: []
+  whiteUsers: []
+  whiteChats: []
+  blackUsers: []
+  blockPrivate: false
+  dropPendingUpdates: true
+  localApiServer: false
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  password: ''
+  # 可填写 redis-server.exe 或它所在的目录；仅本机端口未监听时自动启动。
+  execPath: ''
+  # 与其他 Bot 使用不同 DB，避免历史键互相影响。
+  db: 1
+
+web:
+  enabled: true
+  host: 127.0.0.1
+  port: 3457
+  password: ''
+
+ai:
+  enabled: true
+  # 开启后，私聊普通消息无需 /ai 或角色前缀。
+  privateAutoReply: false
+  defaultProfile: sakura
+  chatHistoryLength: 20
+  historyTtlSeconds: 604800
+  enableUserLock: true
+  requestTimeoutMs: 120000
+
+  roleCards:
+    - name: sakura
+      prompt: 你是小樱。保持角色设定，自然地与用户进行角色扮演。
+
+  profiles:
+    - name: sakura
+      prefixes:
+        - 小樱
+        - 樱花
+      # 开启后，“小樱你好”会完整提交给模型；关闭时只提交“你好”。
+      keepTriggerPrefix: false
+      route: default
+      history: true
+      # 开启后解析并隐藏回复末尾的 <draw> 标签，再异步交给 NovelAI。
+      enableNaiPainting: false
+      naiPrompt: ''
+      enabled: true
+
+  providers:
+    - id: openai
+      protocol: openai
+      baseURL: https://api.openai.com/v1
+      vertex: false
+      credentials:
+        - id: primary
+          apiKey: '请直接填写模型 API Key'
+          serviceAccountRef: ''
+          enabled: true
+          priority: 0
+          weight: 1
+
+  routes:
+    - id: default
+      strategy: priority_weighted
+      temperature: -1
+      topP: -1
+      reasoningLevel: default
+      maxAttempts: 3
+      retryDelayMs: 1000
+      targets:
+        - id: primary
+          provider: openai
+          model: gpt-4.1-mini
+          enabled: true
+          priority: 0
+          weight: 1
+          temperatureOverride: -1
+          topPOverride: -1
+          openaiEnableThinking: false
+          openaiReasoningEffort: inherit
+          geminiThinkingLevel: inherit
+          geminiThinkingBudget: -2
+
+  nativeVision:
+    # 当前消息和明确回复中的图片会直接沿普通模型路由提交，不调用识图工具。
+    maxImages: 4
+    maxBytes: 20971520
+
+  novelAI:
+    enabled: true
+    model: nai-diffusion-5-full
+    baseURL: https://image.novelai.net
+    api: '请直接填写 NovelAI Token'
+    checkV5Usage: true
+    negative: nsfw, lowres, artistic error, scan artifacts, worst quality, bad quality, jpeg artifacts, multiple views, very displeasing, too many watermarks, negative space, blank page
+    qualityTags: very aesthetic, masterpiece, no text
+    width: 832
+    height: 1216
+    scale: 7
+    steps: 28
+    sampler: k_euler_ancestral
+    strength: 0.7
+    noise: 0
+    # 仅注入给 enableNaiPainting=true 的角色；标签不会出现在 Telegram 正文中。
+    chatDrawPrompt: |-
+      **[RP Visual Snapshot — hidden backend tag, no image-tool call]**
+      Continue the roleplay response normally. Do not call an image-generation tool for this snapshot. At the absolute end of the response, append exactly one compact <draw>...</draw> block for the backend to remove from the visible reply and render asynchronously. The closing </draw> tag must be the final characters of the response. Never mention this hidden tag in the roleplay text.
+
+      The tag must describe exactly one concrete visible frame from the current moment. Include only visually observable information and preserve roleplay continuity.
+
+      Every visual description must use one of two forms: accurate English NovelAI/Danbooru-style tags separated by commas, or, when tags cannot clearly express an interaction or spatial relationship, one concise but grammatically complete English sentence with an explicit subject and verb. Never use natural-language fragments, shorthand phrases, or incomplete clauses.
+
+      When a recognized English Danbooru/NovelAI character tag is present, treat it as the source of the character's canonical identity. Do not repeat inherent appearance traits already encoded by that tag, including canonical hair color or style, eye color, body traits, default outfit, or default accessories. Add only scene-specific changes and current-state details such as changed clothing or accessories, pose, action, expression, gaze, interaction, and character-specific objects.
+
+      Only when no reliable recognized character tag exists, describe enough stable visible traits to identify an original or unknown character. Include 1girl, 1boy, or another accurate count, and never invent a character tag.
+
+      For one visible character, a flat prompt remains valid:
+      <draw>1girl, original character, long silver hair, blue eyes, oversized white shirt, sitting, bed, gentle smile, looking at viewer, bedroom, night, bedside lamp, cowboy shot, eye-level, warm backlighting</draw>
+
+      When a reliable character tag exists, use it without reconstructing canonical features:
+      <draw>1girl, hatsune miku (vocaloid), oversized hoodie, sitting, bed, gentle smile, looking at viewer, bedroom, night, bedside lamp, cowboy shot, eye-level, warm backlighting</draw>
+
+      For multiple visible characters, write the shared scene outside square brackets and one independent character prompt in each bracket:
+      <draw>2girls, bedroom, night, bed, sitting, talking, medium shot, eye-level, warm lighting [左: 1girl, long black hair, green eyes, white pajamas, gentle smile, holding pillow, looking at another] [右: 1girl, long silver hair, blue eyes, oversized black shirt, blush, leaning forward, looking at another]</draw>
+
+      Character positions accept 左, 右, 左上, 右上, 左下, 右下, 中间, 上, and 下. Exact percentage coordinates use [@25,55: character tags]. Keep scene, interaction, camera, lighting, and mood outside the brackets. Inside each bracket, use the recognized character tag or, only without one, stable visible appearance; then add scene-specific clothing, pose, expression, and gaze. Do not repeat character appearance traits in the shared prompt.
+    # RP 自动配图直接使用 NovelAI 原生尺寸，宽高必须是 64 的倍数。
+    chatDrawWidth: 1216
+    chatDrawHeight: 832
+    chatDrawCount: 1

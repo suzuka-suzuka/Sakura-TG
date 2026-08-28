@@ -1,0 +1,38 @@
+{
+  "name": "sakura-tg",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "专注角色扮演与 NovelAI 绘图的 Telegram Bot",
+  "main": "src/index.js",
+  "scripts": {
+    "config": "node src/web/start.js",
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "test": "node --test",
+    "web:build": "vite build --config src/web/frontend/vite.config.js",
+    "web:dev": "vite --config src/web/frontend/vite.config.js"
+  },
+  "keywords": [
+    "sakura",
+    "telegram",
+    "bot"
+  ],
+  "author": "suzuka-suzuka",
+  "license": "MIT",
+  "dependencies": {
+    "@google/genai": "^2.11.0",
+    "chalk": "^6.0.0",
+    "grammy": "^1.45.1",
+    "ioredis": "^5.11.1",
+    "js-yaml": "^4.3.0",
+    "openai": "^6.46.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "ws": "^8.19.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
+    "vite": "^7.3.1"
+  }
+}

@@ -305,6 +305,82 @@ test("Vibe 回退遇到底图时在请求前停止，避免消耗 Anlas", async 
   assert.equal(calls, 0);
 });
 
+test("多图拆成串行单张请求，发送未完成也会继续生成下一张", async () => {
+  const events = [];
+  const payloads = [];
+  const releaseDeliveries = [];
+  let activeRequests = 0;
+  let maxActiveRequests = 0;
+
+  const fetchImpl = async (_url, options = {}) => {
+    const requestNumber = payloads.length + 1;
+    payloads.push(JSON.parse(options.body));
+    events.push(`generate-${requestNumber}-start`);
+    activeRequests += 1;
+    maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+    const response = successImageResponse();
+    return {
+      ...response,
+      async arrayBuffer() {
+        await new Promise((resolve) => setImmediate(resolve));
+        activeRequests -= 1;
+        events.push(`generate-${requestNumber}-done`);
+        return response.arrayBuffer();
+      },
+    };
+  };
+
+  const generationTask = requestNovelAIImages({
+    channel: {
+      model: "nai-diffusion-5-full",
+      baseURL: "https://example.test",
+      checkV5Usage: false,
+    },
+    apiKey: "test-token",
+    prompt: "1girl",
+    options: { count: 3 },
+    parameters: { n_samples: 3 },
+    fetchImpl,
+    retryDelaysMs: [],
+    onImageGenerated(_image, index) {
+      events.push(`send-${index + 1}-start`);
+      return new Promise((resolve) => releaseDeliveries.push(resolve));
+    },
+  });
+
+  let timeout;
+  const images = await Promise.race([
+    generationTask,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("生成流程错误地等待了图片发送")),
+        1_000
+      );
+    }),
+  ]).finally(() => clearTimeout(timeout));
+
+  assert.equal(images.length, 3);
+  assert.equal(payloads.length, 3);
+  assert.equal(maxActiveRequests, 1);
+  assert.deepEqual(
+    payloads.map((payload) => payload.parameters.n_samples),
+    [1, 1, 1]
+  );
+  assert.deepEqual(events, [
+    "generate-1-start",
+    "generate-1-done",
+    "send-1-start",
+    "generate-2-start",
+    "generate-2-done",
+    "send-2-start",
+    "generate-3-start",
+    "generate-3-done",
+    "send-3-start",
+  ]);
+  assert.equal(releaseDeliveries.length, 3);
+  releaseDeliveries.forEach((resolve) => resolve());
+});
+
 test("网络异常和 429 按 10、20、30 秒退避后复用同一请求", async () => {
   const delays = [];
   const warnings = [];

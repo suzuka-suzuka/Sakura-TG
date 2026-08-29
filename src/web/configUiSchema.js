@@ -691,7 +691,8 @@ export const CONFIG_UI_SCHEMA = {
           type: "number",
           min: 1,
           max: 4,
-          help: "同一轮最多触发一次绘图；默认生成 1 张。",
+          help:
+            "同一轮最多触发一次绘图；多张会拆成串行单张请求，每张生成后立即发送，发送不阻塞下一张生成。",
         },
       ],
     },

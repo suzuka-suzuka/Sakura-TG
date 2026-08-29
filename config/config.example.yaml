@@ -136,4 +136,5 @@ ai:
     # RP 自动配图直接使用 NovelAI 原生尺寸，宽高必须是 64 的倍数。
     chatDrawWidth: 1216
     chatDrawHeight: 832
+    # 大于 1 时串行发起多次单张请求；每张生成后立即发送，发送不阻塞下一张生成。
     chatDrawCount: 1

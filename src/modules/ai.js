@@ -231,6 +231,31 @@ async function generateAndSendNovelAI(ctx, {
   onQueueStart = null,
 }) {
   return withChatAction(ctx, "upload_photo", async () => {
+    const deliveries = [];
+    let sent = 0;
+    const startImageDelivery = (buffer, index) => {
+      // sendImageBuffer starts the Telegram upload synchronously up to its
+      // first await. Keep the resulting promise for final status accounting;
+      // the provider observes rejections but deliberately does not await it.
+      const delivery = sendImageBuffer(ctx, buffer, {
+        filename: `novelai-${Date.now()}-${index + 1}.png`,
+      })
+        .then((result) => {
+          if (result.ok) sent++;
+          return result;
+        })
+        .catch((error) => {
+          logger.error(
+            `[NovelAI] Telegram 图片发送失败: ${redactMediaErrorMessage(
+              error?.message || error
+            )}`
+          );
+          return { ok: false, reason: "send-failed" };
+        });
+      deliveries.push(delivery);
+      return delivery;
+    };
+
     try {
       const buffers = await generateNovelAIImagesWithService({
         prompt,
@@ -239,17 +264,12 @@ async function generateAndSendNovelAI(ctx, {
         parameters,
         characters,
         onQueueStart,
+        onImageGenerated: startImageDelivery,
       });
       if (buffers.length === 0) {
         return ctx.reply("NovelAI 没有返回图片。");
       }
-      let sent = 0;
-      for (let index = 0; index < buffers.length; index++) {
-        const result = await sendImageBuffer(ctx, buffers[index], {
-          filename: `novelai-${Date.now()}-${index + 1}.png`,
-        });
-        if (result.ok) sent++;
-      }
+      await Promise.all(deliveries);
       if (sent === 0) {
         await ctx.reply("图片已生成，但 Telegram 发送失败。");
       }

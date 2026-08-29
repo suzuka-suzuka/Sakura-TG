@@ -51,6 +51,7 @@ export async function generateNovelAIImagesWithService({
   characters = [],
   negative = null,
   onQueueStart = null,
+  onImageGenerated = null,
 }) {
   try {
     const config = Config.get("ai.novelAI") || {};
@@ -67,6 +68,7 @@ export async function generateNovelAIImagesWithService({
       characters,
       negative,
       onStart: onQueueStart,
+      onImageGenerated,
       timeoutMs: Config.get("ai.requestTimeoutMs") || 120_000,
     });
   } catch (error) {

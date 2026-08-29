@@ -283,7 +283,6 @@ export function buildNovelAIRequest({
   channel = {},
   prompt,
   source = null,
-  options = {},
   model = null,
   negative = null,
   parameters = {},
@@ -313,7 +312,6 @@ export function buildNovelAIRequest({
   ).trim();
   const width = roundDimension(channel?.width, 832);
   const height = roundDimension(channel?.height, 1216);
-  const count = clampInteger(options.count, 1, 1, 4);
   const modelWasOverridden =
     String(useModel).toLowerCase() !==
     String(channel.model || DEFAULT_NOVELAI_MODEL).toLowerCase();
@@ -348,7 +346,7 @@ export function buildNovelAIRequest({
     sampler: channel.sampler || "k_euler_ancestral",
     steps: clampInteger(channel.steps, profile.steps, 1, 50),
     seed: Math.floor(Math.random() * 4_294_967_296),
-    n_samples: count,
+    n_samples: 1,
     autoSmea: false,
     dynamic_thresholding: false,
     controlnet_strength: 1,
@@ -394,6 +392,8 @@ export function buildNovelAIRequest({
   };
 
   generationParameters.params_version = profile.paramsVersion;
+  // 配置多张时由队列任务串行拆分，单次 API 请求始终只生成一张。
+  generationParameters.n_samples = 1;
   if (profile.family === "v5") {
     generationParameters.noise_schedule = "karras";
   }
@@ -844,12 +844,11 @@ export async function requestNovelAIImagesWithRetry({
   }
 }
 
-export async function requestNovelAIImages({
+async function requestSingleNovelAIImage({
   channel,
   apiKey,
   prompt,
   sources = [],
-  options = {},
   parameters = {},
   characters = [],
   negative = null,
@@ -872,7 +871,6 @@ export async function requestNovelAIImages({
     channel,
     prompt,
     source: sources[0] || null,
-    options,
     model: useModel,
     negative,
     parameters,
@@ -883,7 +881,7 @@ export async function requestNovelAIImages({
     !isNovelAI45ZeroAnlasGeneration(payload)
   ) {
     throw new Error(
-      "Vibe Transfer 已切换到 V4.5，但当前请求包含底图、生成多张或超出免费规格，已停止生图以避免消耗 Anlas"
+      "Vibe Transfer 已切换到 V4.5，但当前请求包含底图或超出免费规格，已停止生图以避免消耗 Anlas"
     );
   }
 
@@ -913,7 +911,6 @@ export async function requestNovelAIImages({
           channel,
           prompt,
           source: sources[0] || null,
-          options,
           model: fallbackModel,
           negative,
           parameters,
@@ -941,6 +938,46 @@ export async function requestNovelAIImages({
     waitImpl,
     onRetry,
   });
+}
+
+/**
+ * Split a configured image count into serialized single-image API requests.
+ * The callback is only notified; its return value is deliberately not awaited,
+ * so delivery can overlap with the next generation request.
+ */
+export async function requestNovelAIImages(request = {}) {
+  const {
+    options = {},
+    onImageGenerated = null,
+    ...singleRequest
+  } = request;
+  const count = clampInteger(options.count, 1, 1, 4);
+  const images = [];
+
+  for (let index = 0; index < count; index++) {
+    const generated = await requestSingleNovelAIImage(singleRequest);
+    for (const image of generated) {
+      images.push(image);
+      if (typeof onImageGenerated === "function") {
+        try {
+          const delivery = onImageGenerated(image, images.length - 1);
+          if (delivery && typeof delivery.then === "function") {
+            void Promise.resolve(delivery).catch((error) =>
+              logger.warn(
+                `[NAI] 单张图片生成回调失败: ${error?.message || error}`
+              )
+            );
+          }
+        } catch (error) {
+          logger.warn(
+            `[NAI] 单张图片生成回调失败: ${error?.message || error}`
+          );
+        }
+      }
+    }
+  }
+
+  return images;
 }
 
 const queue = [];

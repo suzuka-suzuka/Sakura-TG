@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DEFAULT_CHAT_DRAW_PROMPT } from "./chatDrawTags.js";
+import { DEFAULT_HISTORY_SUMMARY_PROMPT } from "./historySummaryPrompt.js";
 import {
   DEFAULT_NOVELAI_MODEL,
   DEFAULT_NOVELAI_NEGATIVE,
@@ -167,6 +168,18 @@ const NativeVisionSchema = z.object({
     .default(20 * 1024 * 1024),
 });
 
+const StreamingSchema = z.object({
+  enabled: z.boolean().default(true),
+  privateIntervalMs: z.number().int().min(200).max(10_000).default(800),
+  groupIntervalMs: z.number().int().min(1000).max(30_000).default(2000),
+});
+
+const HistorySummarySchema = z.object({
+  enabled: z.boolean().default(true),
+  keepRounds: z.number().int().min(0).max(100).default(10),
+  prompt: z.string().default(DEFAULT_HISTORY_SUMMARY_PROMPT),
+});
+
 const NovelAIDimensionSchema = z
   .number()
   .int()
@@ -211,6 +224,9 @@ export const AISchema = z
       .min(3600)
       .max(90 * 24 * 60 * 60)
       .default(7 * 24 * 60 * 60),
+    historySummary: HistorySummarySchema.default(() =>
+      HistorySummarySchema.parse({})
+    ),
     enableUserLock: z.boolean().default(true),
     requestTimeoutMs: z
       .number()
@@ -218,6 +234,7 @@ export const AISchema = z
       .min(1000)
       .max(30 * 60 * 1000)
       .default(120_000),
+    streaming: StreamingSchema.default(() => StreamingSchema.parse({})),
     nativeVision: NativeVisionSchema.default(() =>
       NativeVisionSchema.parse({})
     ),

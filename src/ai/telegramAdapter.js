@@ -176,14 +176,26 @@ export async function sendAiText(ctx, text) {
   return sent;
 }
 
+/**
+ * Repeat a chat action (typing, upload_photo) while `task` runs. The task
+ * receives `{ stop }` to end the indicator early, e.g. once a draft is shown.
+ */
 export async function withChatAction(ctx, action, task) {
-  const send = () => ctx.replyWithChatAction(action).catch(() => {});
+  let stopped = false;
+  const send = () =>
+    stopped ? undefined : ctx.replyWithChatAction(action).catch(() => {});
   await send();
   const timer = setInterval(send, 4000);
   timer.unref?.();
+  const control = {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
   try {
-    return await task();
+    return await task(control);
   } finally {
-    clearInterval(timer);
+    control.stop();
   }
 }

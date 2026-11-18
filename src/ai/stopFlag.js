@@ -1,6 +1,7 @@
 export const activeAiTasks = new Map();
 export const aiStopRequests = new Set();
 
+const taskControllers = new Map();
 let taskCounter = 0;
 
 export function getStopKey(ctx) {
@@ -18,12 +19,19 @@ export function startAiTask(ctx) {
   const tasks = activeAiTasks.get(key) || new Set();
   tasks.add(taskId);
   activeAiTasks.set(key, tasks);
+  taskControllers.set(taskId, new AbortController());
   return taskId;
+}
+
+/** Signal aborted when the user asks to stop this task; streams cancel on it. */
+export function getAiTaskSignal(taskId) {
+  return taskControllers.get(taskId)?.signal || null;
 }
 
 export function finishAiTask(ctx, taskId) {
   if (!taskId) return;
   aiStopRequests.delete(taskId);
+  taskControllers.delete(taskId);
   const key = getStopKey(ctx);
   const tasks = activeAiTasks.get(key);
   if (!tasks) return;
@@ -34,7 +42,10 @@ export function finishAiTask(ctx, taskId) {
 export function requestStopCurrentTasks(ctx) {
   const tasks = activeAiTasks.get(getStopKey(ctx));
   if (!tasks?.size) return false;
-  for (const taskId of tasks) aiStopRequests.add(taskId);
+  for (const taskId of tasks) {
+    aiStopRequests.add(taskId);
+    taskControllers.get(taskId)?.abort();
+  }
   return true;
 }
 

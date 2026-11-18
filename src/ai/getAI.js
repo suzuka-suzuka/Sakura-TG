@@ -30,12 +30,36 @@ const GEMINI_THINKING_LEVELS = {
   high: ThinkingLevel.HIGH,
 };
 
+export const AI_REQUEST_STOPPED_MESSAGE = "AI 请求已停止";
+
 function normalizeRequestError(error) {
   if (error?.isAIRequestError) return error;
   const wrapped = new Error(error?.message || String(error));
   wrapped.status = Number(error?.status || error?.response?.status) || null;
   wrapped.isAIRequestError = true;
   return wrapped;
+}
+
+function requestTimeoutMs() {
+  return Config.get("ai.requestTimeoutMs") || 120_000;
+}
+
+/** Combine the whole-request timeout with the user's stop signal. */
+function requestSignal(timeoutMs, stopSignal) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return stopSignal ? AbortSignal.any([timeout, stopSignal]) : timeout;
+}
+
+/** Report accumulated text without letting a display error break the stream. */
+function createTextNotifier(onText) {
+  if (typeof onText !== "function") return null;
+  return (text) => {
+    try {
+      onText(text);
+    } catch (error) {
+      logger.warn(`[AI] 流式输出回调失败: ${error?.message || error}`);
+    }
+  };
 }
 
 function normalizeReasoningEffort(value) {
@@ -105,21 +129,47 @@ function historyToGeminiContents(history = []) {
   });
 }
 
+/**
+ * The OpenAI SDK ends a stream quietly when its signal aborts, so a stop or a
+ * timeout must be detected from the signal instead of a thrown error.
+ */
+function assertStreamNotAborted(streamSignal, stopSignal, timeoutMs) {
+  if (!streamSignal.aborted) return;
+  stopSignal?.throwIfAborted();
+  throw new Error(`模型流式请求超时（${timeoutMs} ms）`);
+}
+
+async function readOpenAIStream(stream, notify, signal) {
+  let text = "";
+  let chunkCount = 0;
+  for await (const chunk of stream) {
+    if (signal.aborted) break;
+    chunkCount += 1;
+    const delta = normalizeOpenAIContent(chunk?.choices?.[0]?.delta?.content);
+    if (!delta) continue;
+    text += delta;
+    notify(text);
+  }
+  return { text, chunkCount };
+}
+
 async function getOpenAIResponse(
   channel,
   queryParts,
   presetPrompt,
-  history = []
+  history = [],
+  { onText = null, signal = null } = {}
 ) {
   if (!isRequestConfigComplete(channel, "openai")) {
     throw new Error("OpenAI 渠道配置不完整");
   }
 
+  const timeoutMs = requestTimeoutMs();
   const openai = new OpenAI({
     apiKey: channel.apiKey,
     ...(channel.baseURL?.trim() && { baseURL: channel.baseURL.trim() }),
     maxRetries: 0,
-    timeout: Config.get("ai.requestTimeoutMs") || 120_000,
+    timeout: timeoutMs,
   });
   const messages = [];
   const systemPrompt = String(presetPrompt || "").trim();
@@ -150,8 +200,31 @@ async function getOpenAIResponse(
   );
   if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
 
+  const notify = createTextNotifier(onText);
+  if (notify) {
+    // The SDK timeout only covers the response headers, so bound the whole
+    // stream with the same request timeout the non-streaming call uses.
+    const streamSignal = requestSignal(timeoutMs, signal);
+    const stream = await openai.chat.completions.create(
+      { ...payload, stream: true },
+      { signal: streamSignal }
+    );
+    const streamed = await readOpenAIStream(stream, notify, streamSignal);
+    assertStreamNotAborted(streamSignal, signal, timeoutMs);
+    if (streamed.text) return { text: streamed.text };
+    if (streamed.chunkCount > 0) throw new Error("模型没有返回内容");
+    // No SSE events at all: the endpoint ignored stream=true and answered
+    // with a plain JSON body, so repeat the request without streaming.
+    logger.warn(
+      `[AI] ${channel.name || channel.model} 未返回流式数据，改用非流式请求`
+    );
+  }
+
   const completion = parseCompletion(
-    await openai.chat.completions.create(payload)
+    await openai.chat.completions.create(
+      payload,
+      signal ? { signal } : undefined
+    )
   );
   if (!Array.isArray(completion?.choices)) {
     throw new Error("OpenAI 兼容端点返回了异常格式");
@@ -160,6 +233,44 @@ async function getOpenAIResponse(
     completion.choices[0]?.message?.content
   );
   if (!text) throw new Error("模型没有返回内容");
+  notify?.(text);
+  return { text };
+}
+
+function geminiCandidateText(candidate) {
+  return (candidate?.content?.parts || [])
+    .filter((part) => part?.thought !== true && part?.text)
+    .map((part) => part.text)
+    .join("");
+}
+
+function assertGeminiFinishReason(finishReason) {
+  if (finishReason && !["STOP", "MAX_TOKENS"].includes(finishReason)) {
+    throw new Error(`Gemini 生成中止：${finishReason}`);
+  }
+}
+
+async function readGeminiStream(stream, notify, signal) {
+  let text = "";
+  let finishReason = null;
+  for await (const chunk of stream) {
+    if (signal.aborted) break;
+    if (chunk?.promptFeedback?.blockReason) {
+      throw new Error(`请求被拦截：${chunk.promptFeedback.blockReason}`);
+    }
+    const candidate = chunk?.candidates?.[0];
+    if (candidate?.finishReason) finishReason = candidate.finishReason;
+    const delta = geminiCandidateText(candidate);
+    if (!delta) continue;
+    text += delta;
+    notify(text);
+  }
+  return { text, finishReason };
+}
+
+function finishGeminiStream({ text, finishReason }) {
+  assertGeminiFinishReason(finishReason);
+  if (!text) throw new Error("Gemini 返回内容为空");
   return { text };
 }
 
@@ -167,7 +278,8 @@ async function getGeminiResponse(
   channel,
   queryParts,
   presetPrompt,
-  history = []
+  history = [],
+  { onText = null, signal = null } = {}
 ) {
   if (!isRequestConfigComplete(channel, "gemini")) {
     throw new Error("Gemini 渠道配置不完整");
@@ -183,6 +295,8 @@ async function getGeminiResponse(
   }
   if (contents.length === 0) throw new Error("没有可提交给模型的查询");
 
+  const timeoutMs = requestTimeoutMs();
+  const abortSignal = requestSignal(timeoutMs, signal);
   const requestConfig = {
     safetySettings: [
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
@@ -190,9 +304,7 @@ async function getGeminiResponse(
       { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
       { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
     ],
-    abortSignal: AbortSignal.timeout(
-      Config.get("ai.requestTimeoutMs") || 120_000
-    ),
+    abortSignal,
   };
   if (Number.isFinite(channel.temperature)) {
     requestConfig.temperature = channel.temperature;
@@ -213,11 +325,23 @@ async function getGeminiResponse(
   const systemPrompt = String(presetPrompt || "").trim();
   if (systemPrompt) requestConfig.systemInstruction = systemPrompt;
 
-  const response = await client.models.generateContent({
+  const request = {
     model: channel.model,
     contents,
     config: requestConfig,
-  });
+  };
+  const notify = createTextNotifier(onText);
+  if (notify) {
+    const streamed = await readGeminiStream(
+      await client.models.generateContentStream(request),
+      notify,
+      abortSignal
+    );
+    assertStreamNotAborted(abortSignal, signal, timeoutMs);
+    return finishGeminiStream(streamed);
+  }
+
+  const response = await client.models.generateContent(request);
   if (response?.promptFeedback?.blockReason) {
     throw new Error(`请求被拦截：${response.promptFeedback.blockReason}`);
   }
@@ -225,16 +349,8 @@ async function getGeminiResponse(
   if (!candidate?.content?.parts) {
     throw new Error("Gemini 没有返回候选内容");
   }
-  if (
-    candidate.finishReason &&
-    !["STOP", "MAX_TOKENS"].includes(candidate.finishReason)
-  ) {
-    throw new Error(`Gemini 生成中止：${candidate.finishReason}`);
-  }
-  const text = candidate.content.parts
-    .filter((part) => part?.thought !== true && part.text)
-    .map((part) => part.text)
-    .join("");
+  assertGeminiFinishReason(candidate.finishReason);
+  const text = geminiCandidateText(candidate);
   if (!text) throw new Error("Gemini 返回内容为空");
   return { text };
 }
@@ -242,14 +358,21 @@ async function getGeminiResponse(
 /**
  * Execute a pure chat route. Current images follow the same target order and
  * fallback path as text; there is deliberately no analyzer/tool fallback.
+ *
+ * With `options.onText`, the response is streamed and the callback receives
+ * the accumulated text of the current attempt; a fallback attempt starts over
+ * from its own first token. `options.signal` stops the request without trying
+ * further targets.
  */
 export async function getAI(
   routeId,
   _ctx,
   queryParts,
   presetPrompt,
-  history = []
+  history = [],
+  options = {}
 ) {
+  const { onText = null, signal = null } = options || {};
   let plan;
   try {
     plan = createRouteExecutionPlan(routeId);
@@ -262,22 +385,38 @@ export async function getAI(
 
   let lastError = null;
   for (let index = 0; index < plan.attempts.length; index++) {
+    if (signal?.aborted) return AI_REQUEST_STOPPED_MESSAGE;
     const attempt = plan.attempts[index];
     const channel = attempt.requestConfig;
     logger.info(
       `[AI Router] route=${routeId} target=${attempt.target.id} provider=${attempt.provider.id} credential=${attempt.credential.id} model=${channel.model}`
     );
+    const requestOptions = { onText, signal };
     try {
       const response =
         channel.channelType === "gemini"
-          ? await getGeminiResponse(channel, queryParts, presetPrompt, history)
-          : await getOpenAIResponse(channel, queryParts, presetPrompt, history);
+          ? await getGeminiResponse(
+              channel,
+              queryParts,
+              presetPrompt,
+              history,
+              requestOptions
+            )
+          : await getOpenAIResponse(
+              channel,
+              queryParts,
+              presetPrompt,
+              history,
+              requestOptions
+            );
+      if (signal?.aborted) return AI_REQUEST_STOPPED_MESSAGE;
       return {
         ...response,
         sourceProtocol: channel.channelType,
         requestQueryParts: queryParts,
       };
     } catch (error) {
+      if (signal?.aborted) return AI_REQUEST_STOPPED_MESSAGE;
       lastError = normalizeRequestError(error);
     }
 

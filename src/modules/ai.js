@@ -17,9 +17,16 @@ import {
 import {
   clearAllProfilesForUser,
   clearConversationHistory,
+  getConversationHistoryKey,
+  groupConversationRounds,
   loadConversationHistory,
+  loadConversationSummary,
+  runConversationExclusive,
   saveConversationHistory,
 } from "../ai/conversationHistory.js";
+import { compressConversationHistory } from "../ai/conversationSummary.js";
+import { formatHistorySummarySection } from "../ai/historySummaryPrompt.js";
+import { createTelegramStreamPresenter } from "../ai/telegramStream.js";
 import { buildMultimodalQueryParts } from "../ai/messageParts.js";
 import { parseNovelAICommandArgs } from "../ai/media/novelAICommand.js";
 import {
@@ -86,6 +93,57 @@ function chatDrawPrompt(profile) {
     return "";
   }
   return String(novelAI.chatDrawPrompt || "").trim();
+}
+
+/**
+ * The system prompt of one conversation: role card, RP drawing rules and the
+ * stored 前情提要. History compression reuses exactly this prompt.
+ */
+function conversationPrompt(profile, summary = "") {
+  return [
+    rolePrompt(profile),
+    chatDrawPrompt(profile),
+    formatHistorySummarySection(summary),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function createChatStreamPresenter(ctx, typing) {
+  const streaming = Config.get("ai.streaming") || {};
+  if (streaming.enabled === false) return null;
+  return createTelegramStreamPresenter(ctx, {
+    privateIntervalMs: streaming.privateIntervalMs,
+    groupIntervalMs: streaming.groupIntervalMs,
+    // A private-chat draft already shows progress; typing would compete.
+    onFirstDisplay: (mode) => {
+      if (mode === "draft") typing?.stop();
+    },
+  });
+}
+
+function needsHistoryCompression(history) {
+  const aiConfig = Config.get("ai") || {};
+  const limit = Number(aiConfig.chatHistoryLength ?? 20);
+  return (
+    aiConfig.historySummary?.enabled !== false &&
+    limit > 0 &&
+    groupConversationRounds(history).length > limit
+  );
+}
+
+/** Queue compression behind the current turn on the same conversation. */
+function scheduleHistoryCompression(ctx, profile, historyName, historyKey) {
+  void runConversationExclusive(historyKey, () =>
+    compressConversationHistory({
+      ctx,
+      historyName,
+      route: profile.route,
+      buildSystemPrompt: (summary) => conversationPrompt(profile, summary),
+    })
+  ).catch((error) =>
+    logger.error(`[History Summary] 压缩任务失败: ${error.message}`)
+  );
 }
 
 function parseProfileQuery(rawText) {
@@ -165,7 +223,7 @@ async function executeChat(ctx, profile, rawQuery) {
   }
 
   try {
-    await withChatAction(ctx, "typing", async () => {
+    await withChatAction(ctx, "typing", async (typing) => {
       let images;
       try {
         images = await collectTelegramImages(ctx);
@@ -183,42 +241,79 @@ async function executeChat(ctx, profile, rawQuery) {
         return;
       }
 
+      const turn = { query, images, typing };
+      if (!profile.history) {
+        await runChatTurn(ctx, profile, turn);
+        return;
+      }
       const historyName = getPrimaryPrefix(profile);
-      const history = profile.history
-        ? await loadConversationHistory(ctx, historyName)
-        : [];
-      const result = await runChat({
-        ctx,
-        route: profile.route,
-        queryParts: buildMultimodalQueryParts(query, images),
-        prompt: [rolePrompt(profile), chatDrawPrompt(profile)]
-          .filter(Boolean)
-          .join("\n\n"),
-        history,
-      });
-
-      if (profile.history) {
-        // 保留模型原始 <draw> 标签作为对话连续性的一部分；
-        // 标签只在发送 Telegram 可见正文时隐藏。
-        await saveConversationHistory(ctx, result.history, historyName);
-      }
-      if (result.status === "model_error") {
-        await ctx.reply(result.error);
-      } else if (result.status === "stopped") {
-        await ctx.reply("已停止当前 AI 任务。");
-      } else if (result.finalText) {
-        await dispatchChatModelText(ctx, profile, result.finalText, {
-          scheduled: false,
-        });
-      } else {
-        await ctx.reply("模型没有返回可显示的文字。");
-      }
+      const historyKey = getConversationHistoryKey(ctx, historyName);
+      // Waits for a running compression of this conversation to finish.
+      await runConversationExclusive(historyKey, () =>
+        runChatTurn(ctx, profile, { ...turn, historyName, historyKey })
+      );
     });
   } catch (error) {
     logger.error(`[AI Chat] 处理失败: ${error.message}`);
     await ctx.reply("AI 处理出错，请稍后再试。");
   } finally {
     releaseLock(ctx, lock);
+  }
+}
+
+async function runChatTurn(
+  ctx,
+  profile,
+  { query, images, typing, historyName = null, historyKey = null }
+) {
+  const [history, summary] = historyName
+    ? await Promise.all([
+        loadConversationHistory(ctx, historyName),
+        loadConversationSummary(ctx, historyName),
+      ])
+    : [[], ""];
+  const presenter = createChatStreamPresenter(ctx, typing);
+
+  try {
+    const result = await runChat({
+      ctx,
+      route: profile.route,
+      queryParts: buildMultimodalQueryParts(query, images),
+      prompt: conversationPrompt(profile, summary),
+      history,
+      onText: presenter ? (text) => presenter.update(text) : null,
+    });
+
+    if (historyName) {
+      // 保留模型原始 <draw> 标签作为对话连续性的一部分；
+      // 标签只在发送 Telegram 可见正文时隐藏。
+      await saveConversationHistory(ctx, result.history, historyName);
+    }
+    if (result.status === "completed" && result.finalText) {
+      await dispatchChatModelText(
+        ctx,
+        profile,
+        result.finalText,
+        { scheduled: false },
+        presenter
+      );
+      if (historyName && needsHistoryCompression(result.history)) {
+        scheduleHistoryCompression(ctx, profile, historyName, historyKey);
+      }
+      return;
+    }
+
+    await presenter?.close();
+    if (result.status === "model_error") {
+      await ctx.reply(result.error);
+    } else if (result.status === "stopped") {
+      await ctx.reply("已停止当前 AI 任务。");
+    } else {
+      await ctx.reply("模型没有返回可显示的文字。");
+    }
+  } finally {
+    // Removes a half-streamed group message when the turn did not finish it.
+    await presenter?.close();
   }
 }
 
@@ -425,7 +520,8 @@ async function dispatchChatModelText(
   ctx,
   profile,
   responseText,
-  drawState
+  drawState,
+  presenter = null
 ) {
   const novelAI = Config.get("ai.novelAI") || {};
   const dispatched = await dispatchTaggedChatResponse({
@@ -434,7 +530,8 @@ async function dispatchChatModelText(
       profile?.enableNaiPainting === true && novelAI.enabled !== false,
     promptSuffix: profile?.naiPrompt || "",
     drawState,
-    sendText: (text) => sendAiText(ctx, text),
+    sendText: (text) =>
+      presenter ? presenter.finish(text) : sendAiText(ctx, text),
     startDrawing: ({ prompt, characters }) =>
       generateAndSendNovelAI(ctx, {
         prompt,
@@ -497,7 +594,11 @@ async function handleForget(ctx) {
   const profile =
     enabledProfiles().find((item) => item.name === input) || defaultProfile();
   if (!profile) return ctx.reply("没有可清除的角色历史。");
-  await clearConversationHistory(ctx, getPrimaryPrefix(profile));
+  const historyName = getPrimaryPrefix(profile);
+  await runConversationExclusive(
+    getConversationHistoryKey(ctx, historyName),
+    () => clearConversationHistory(ctx, historyName)
+  );
   await ctx.reply(`已清除“${profile.name}”的当前对话历史。`);
 }
 

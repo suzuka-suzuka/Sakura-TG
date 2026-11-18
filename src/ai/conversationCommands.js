@@ -2,8 +2,11 @@ import {
   clearAllConversationHistories,
   clearAllProfilesForUser,
   clearConversationHistory,
+  getConversationHistoryKey,
   groupConversationRounds,
   loadConversationHistory,
+  loadConversationSummary,
+  runConversationExclusive,
   saveConversationHistory,
 } from "./conversationHistory.js";
 import {
@@ -187,6 +190,14 @@ export function tamperConversationHistory(history, index, newContent) {
   };
 }
 
+/** History edits queue behind a running compression of the same rounds. */
+function withConversation(ctx, storedHistoryName, task) {
+  return runConversationExclusive(
+    getConversationHistoryKey(ctx, storedHistoryName),
+    task
+  );
+}
+
 function profileName(profile) {
   return profile?.name || getPrimaryPrefix(profile) || "默认角色";
 }
@@ -204,7 +215,7 @@ function preview(value, maxLength = 80) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
-function formatConversationList(history, profile) {
+export function formatConversationList(history, profile, summary = "") {
   const rounds = groupConversationRounds(history);
   const sections = rounds.map((round, roundIndex) => {
     const messages = round
@@ -217,8 +228,10 @@ function formatConversationList(history, profile) {
       .filter(Boolean);
     return [`【第 ${roundIndex + 1} 轮】`, ...messages].join("\n");
   });
+  const summaryText = String(summary || "").trim();
   return [
     `「${profileName(profile)}」对话历史（共 ${rounds.length} 轮）`,
+    ...(summaryText ? [`【前情提要】\n${summaryText}`] : []),
     ...sections,
   ].join("\n\n");
 }
@@ -312,17 +325,22 @@ export async function handleChineseConversationCommand(ctx, {
     }
     const storedHistoryName = historyName(profile);
     if (command.type === "clear") {
-      await clearConversationHistory(ctx, storedHistoryName);
+      await withConversation(ctx, storedHistoryName, () =>
+        clearConversationHistory(ctx, storedHistoryName)
+      );
       await ctx.reply(`你与「${profileName(profile)}」的对话历史已清空。`);
       return true;
     }
 
-    const history = await loadConversationHistory(ctx, storedHistoryName);
-    if (history.length === 0) {
+    const [history, summary] = await Promise.all([
+      loadConversationHistory(ctx, storedHistoryName),
+      loadConversationSummary(ctx, storedHistoryName),
+    ]);
+    if (history.length === 0 && !summary) {
       await ctx.reply(`目前没有与「${profileName(profile)}」的对话历史。`);
       return true;
     }
-    await sendAiText(ctx, formatConversationList(history, profile));
+    await sendAiText(ctx, formatConversationList(history, profile, summary));
     return true;
   }
 
@@ -338,8 +356,16 @@ export async function handleChineseConversationCommand(ctx, {
     }
 
     const storedHistoryName = historyName(target.profile);
-    const history = await loadConversationHistory(ctx, storedHistoryName);
-    const result = rollbackConversationHistory(history, target.rounds);
+    const result = await withConversation(ctx, storedHistoryName, async () => {
+      const history = await loadConversationHistory(ctx, storedHistoryName);
+      const outcome = rollbackConversationHistory(history, target.rounds);
+      if (outcome.status === "ok") {
+        // Saving an empty history deletes only the rounds; the 前情提要 of
+        // older, already compressed rounds stays.
+        await saveConversationHistory(ctx, outcome.history, storedHistoryName);
+      }
+      return outcome;
+    });
     if (result.status === "empty") {
       await ctx.reply(`目前没有与「${profileName(target.profile)}」的对话历史。`);
       return true;
@@ -349,11 +375,6 @@ export async function handleChineseConversationCommand(ctx, {
       return true;
     }
 
-    if (result.history.length === 0) {
-      await clearConversationHistory(ctx, storedHistoryName);
-    } else {
-      await saveConversationHistory(ctx, result.history, storedHistoryName);
-    }
     const direction = result.deleteFromFront ? "开头" : "末尾";
     await ctx.reply(
       `已从「${profileName(target.profile)}」对话${direction}删除 ${result.removedRounds} 轮，当前剩余 ${result.remainingRounds} 轮。`
@@ -373,12 +394,18 @@ export async function handleChineseConversationCommand(ctx, {
     }
 
     const storedHistoryName = historyName(target.profile);
-    const history = await loadConversationHistory(ctx, storedHistoryName);
-    const result = tamperConversationHistory(
-      history,
-      target.index,
-      target.newContent
-    );
+    const result = await withConversation(ctx, storedHistoryName, async () => {
+      const history = await loadConversationHistory(ctx, storedHistoryName);
+      const outcome = tamperConversationHistory(
+        history,
+        target.index,
+        target.newContent
+      );
+      if (outcome.status === "ok") {
+        await saveConversationHistory(ctx, outcome.history, storedHistoryName);
+      }
+      return outcome;
+    });
     if (result.status === "empty") {
       await ctx.reply(`目前没有与「${profileName(target.profile)}」的 AI 回复记录。`);
       return true;
@@ -392,7 +419,6 @@ export async function handleChineseConversationCommand(ctx, {
       return true;
     }
 
-    await saveConversationHistory(ctx, result.history, storedHistoryName);
     const direction = target.index > 0
       ? `倒数第 ${target.index}`
       : `正数第 ${Math.abs(target.index)}`;

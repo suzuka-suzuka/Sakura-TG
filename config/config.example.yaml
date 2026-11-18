@@ -32,10 +32,22 @@ ai:
   # 开启后，私聊普通消息无需 /ai 或角色前缀。
   privateAutoReply: false
   defaultProfile: sakura
+  # 超过这么多轮后，较早的轮次会被压缩成前情提要（见 historySummary）。
   chatHistoryLength: 20
   historyTtlSeconds: 604800
+  historySummary:
+    enabled: true
+    # 压缩后保留最近多少轮原文，其余轮次连同旧的前情提要一起压缩。
+    keepRounds: 10
+    # 不写 prompt 时使用内置压缩指令；它作为最后一条用户消息发送，
+    # 系统提示词与当前对话完全相同。
   enableUserLock: true
   requestTimeoutMs: 120000
+  # 私聊用 Telegram 消息草稿实时显示回复，群聊先发消息再定时编辑。
+  streaming:
+    enabled: true
+    privateIntervalMs: 800
+    groupIntervalMs: 2000
 
   roleCards:
     - name: sakura

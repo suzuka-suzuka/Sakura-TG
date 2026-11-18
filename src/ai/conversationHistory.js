@@ -4,6 +4,7 @@ import { logger } from "../logger.js";
 import { getRedis } from "../redis.js";
 
 const KEY_PREFIX = "sakuratg:ai:conversation:v1";
+const SUMMARY_KEY_PREFIX = "sakuratg:ai:conversation-summary:v1";
 
 function contextIds(ctx) {
   return {
@@ -71,16 +72,41 @@ export function trimConversationHistoryByRounds(
   ).flat();
 }
 
-export async function loadConversationHistory(ctx, profileName) {
-  const redis = getRedis();
+function historyTtlSeconds(aiConfig) {
+  return aiConfig.historyTtlSeconds || 7 * 24 * 60 * 60;
+}
+
+/**
+ * Rounds kept in Redis. With summaries on, rounds past chatHistoryLength wait
+ * for compression instead of being dropped; twice the limit is a backstop in
+ * case compression keeps failing.
+ */
+export function getStoredHistoryRoundLimit(aiConfig = Config.get("ai") || {}) {
+  const limit = Math.max(
+    0,
+    Math.floor(Number(aiConfig.chatHistoryLength ?? 20) || 0)
+  );
+  return limit > 0 && aiConfig.historySummary?.enabled !== false
+    ? limit * 2
+    : limit;
+}
+
+export async function loadConversationHistory(
+  ctx,
+  profileName,
+  { redis = null } = {}
+) {
+  const client = redis || getRedis();
   const key = getConversationHistoryKey(ctx, profileName);
-  const payload = await redis.get(key);
+  const payload = await client.get(key);
   if (!payload) return [];
   try {
     const parsed = JSON.parse(payload);
     const history = sanitizeConversationHistory(parsed);
     if (JSON.stringify(parsed) !== JSON.stringify(history)) {
-      await saveConversationHistory(ctx, history, profileName);
+      await saveConversationHistory(ctx, history, profileName, {
+        redis: client,
+      });
       logger.info(
         `[ConversationHistory] 已迁移为纯文本历史: ${profileName}`
       );
@@ -90,7 +116,7 @@ export async function loadConversationHistory(ctx, profileName) {
     logger.warn(
       `[ConversationHistory] 历史解析失败，已清除: ${error.message}`
     );
-    await redis.del(key);
+    await client.del(key);
     return [];
   }
 }
@@ -98,12 +124,14 @@ export async function loadConversationHistory(ctx, profileName) {
 export async function saveConversationHistory(
   ctx,
   currentHistory,
-  profileName
+  profileName,
+  { redis = null } = {}
 ) {
+  const client = redis || getRedis();
   const aiConfig = Config.get("ai") || {};
   const trimmed = trimConversationHistoryByRounds(
     sanitizeConversationHistory(currentHistory),
-    aiConfig.chatHistoryLength ?? 20
+    getStoredHistoryRoundLimit(aiConfig)
   );
   if (Array.isArray(currentHistory)) {
     currentHistory.splice(0, currentHistory.length, ...trimmed);
@@ -111,19 +139,64 @@ export async function saveConversationHistory(
 
   const key = getConversationHistoryKey(ctx, profileName);
   if (trimmed.length === 0) {
-    await getRedis().del(key);
+    await client.del(key);
     return;
   }
-  await getRedis().set(
+  const ttl = historyTtlSeconds(aiConfig);
+  await client.set(key, JSON.stringify(trimmed), "EX", ttl);
+  // Keep the summary alive exactly as long as the rounds it precedes.
+  await client.expire?.(getConversationSummaryKey(ctx, profileName), ttl);
+}
+
+export function getConversationSummaryKey(ctx, profileName) {
+  const { chatId, userId } = contextIds(ctx);
+  return `${SUMMARY_KEY_PREFIX}:${chatId}:${userId}:${profileKey(profileName)}`;
+}
+
+/** The compressed 前情提要 for rounds that no longer exist verbatim. */
+export async function loadConversationSummary(
+  ctx,
+  profileName,
+  { redis = null } = {}
+) {
+  const client = redis || getRedis();
+  const payload = await client.get(getConversationSummaryKey(ctx, profileName));
+  if (!payload) return "";
+  try {
+    const parsed = JSON.parse(payload);
+    return String(parsed?.text ?? "").trim();
+  } catch {
+    return String(payload).trim();
+  }
+}
+
+export async function saveConversationSummary(
+  ctx,
+  summary,
+  profileName,
+  { redis = null } = {}
+) {
+  const client = redis || getRedis();
+  const key = getConversationSummaryKey(ctx, profileName);
+  const text = String(summary || "").trim();
+  if (!text) {
+    await client.del(key);
+    return;
+  }
+  await client.set(
     key,
-    JSON.stringify(trimmed),
+    JSON.stringify({ text, updatedAt: Date.now() }),
     "EX",
-    aiConfig.historyTtlSeconds || 7 * 24 * 60 * 60
+    historyTtlSeconds(Config.get("ai") || {})
   );
 }
 
+/** Clear a profile's rounds and its summary. */
 export async function clearConversationHistory(ctx, profileName) {
-  return getRedis().del(getConversationHistoryKey(ctx, profileName));
+  return getRedis().del(
+    getConversationHistoryKey(ctx, profileName),
+    getConversationSummaryKey(ctx, profileName)
+  );
 }
 
 async function clearConversationKeys(pattern) {
@@ -143,11 +216,36 @@ async function clearConversationKeys(pattern) {
   return deleted;
 }
 
+/** Returns the number of cleared histories; their summaries go with them. */
 export async function clearAllProfilesForUser(ctx) {
   const { chatId, userId } = contextIds(ctx);
-  return clearConversationKeys(`${KEY_PREFIX}:${chatId}:${userId}:*`);
+  const deleted = await clearConversationKeys(
+    `${KEY_PREFIX}:${chatId}:${userId}:*`
+  );
+  await clearConversationKeys(`${SUMMARY_KEY_PREFIX}:${chatId}:${userId}:*`);
+  return deleted;
 }
 
 export async function clearAllConversationHistories() {
-  return clearConversationKeys(`${KEY_PREFIX}:*`);
+  const deleted = await clearConversationKeys(`${KEY_PREFIX}:*`);
+  await clearConversationKeys(`${SUMMARY_KEY_PREFIX}:*`);
+  return deleted;
+}
+
+const conversationQueues = new Map();
+
+/**
+ * Run tasks for one conversation key one at a time, so a background history
+ * compression and the next chat turn never read and write the same rounds
+ * concurrently.
+ */
+export function runConversationExclusive(key, task) {
+  const previous = conversationQueues.get(key) || Promise.resolve();
+  const run = previous.then(() => task());
+  const tail = run.catch(() => {});
+  conversationQueues.set(key, tail);
+  void tail.then(() => {
+    if (conversationQueues.get(key) === tail) conversationQueues.delete(key);
+  });
+  return run;
 }

@@ -3,6 +3,7 @@ import { sanitizeConversationHistory } from "./conversationHistory.js";
 import {
   checkAndClearStopFlag,
   finishAiTask,
+  getAiTaskSignal,
   startAiTask,
 } from "./stopFlag.js";
 
@@ -16,6 +17,9 @@ function persistentUserParts(queryParts = []) {
  * One roleplay turn: send the current text/images directly to the configured
  * chat route and persist only visible text. There are no tools, intermediate
  * tool messages, group context, image-analysis fallbacks, or long-term memory.
+ *
+ * `onText` switches the request to streaming and receives the accumulated
+ * reply text; a stop request aborts the stream immediately.
  */
 export async function runChat({
   ctx,
@@ -23,29 +27,32 @@ export async function runChat({
   queryParts,
   prompt,
   history = [],
+  onText = null,
+  requestModel = getAI,
 }) {
   const cleanHistory = sanitizeConversationHistory(history);
   const taskId = startAiTask(ctx);
 
   try {
-    const response = await getAI(
+    const response = await requestModel(
       route,
       ctx,
       queryParts,
       prompt,
-      cleanHistory
+      cleanHistory,
+      { onText, signal: getAiTaskSignal(taskId) }
     );
-    if (typeof response === "string") {
+    if (checkAndClearStopFlag(taskId)) {
       return {
-        status: "model_error",
-        error: response,
+        status: "stopped",
         history: cleanHistory,
         finalText: "",
       };
     }
-    if (checkAndClearStopFlag(taskId)) {
+    if (typeof response === "string") {
       return {
-        status: "stopped",
+        status: "model_error",
+        error: response,
         history: cleanHistory,
         finalText: "",
       };

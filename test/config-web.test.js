@@ -250,6 +250,8 @@ test("UI schema 只展示基础服务、角色扮演、原生图片输入和 Nov
       "redis",
       "web",
       "ai-general",
+      "streaming",
+      "history-summary",
       "role-cards",
       "profiles",
       "providers",

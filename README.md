@@ -135,6 +135,12 @@ ai:
 
 显式绘图、RP 自动配图、图生图和 Vibe 共用这一套 NovelAI 配置，不再选择图片渠道。RP 自动配图使用原生的 `width × height`，宽高必须是 64 的倍数；上例为横图 `1216 × 832`。`chatDrawCount` 大于 1 时不会提高单次请求的 `n_samples`，而是串行发起对应次数的单张请求；每张生成后立即开始发送，Telegram 发送未完成也不会阻塞下一张生成。
 
+### 第三方站点
+
+`baseURL` 可以填写兼容 NovelAI 接口的第三方站点，`api` 填该站点提供的 Key（以 `Authorization: Bearer` 发送，多行可轮询）。地址可以是站点根路径，如 `https://example.com/nai`，此时请求 `https://example.com/nai/ai/generate-image`；也可以直接粘贴以 `/ai/generate-image` 结尾的完整地址。请求体与官方完全一致，响应支持官方 ZIP、直接返回的图片，以及 JSON（base64、data URL 或图片链接，如 `{"images": [...]}`、`{"data": [{"b64_json": ...}]}`、`{"data": [{"url": ...}]}`）和 SSE `data:` 事件。
+
+非 `novelai.net` 的地址会自动跳过 `checkV5Usage` 的官方账户用量查询，因为第三方站点使用自己的额度且通常没有 `/user/subscription` 接口。
+
 绘图命令：
 
 - `/nai 提示词`

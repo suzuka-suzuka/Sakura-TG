@@ -6,7 +6,11 @@ import {
   appendNovelAIQualityTags,
   buildNovelAIRequest,
   checkNovelAIUsageLimit,
+  extractNovelAIImages,
   getNovelAIModelProfile,
+  isOfficialNovelAIBaseURL,
+  novelAIGenerationEndpoint,
+  parseNovelAIImageResponse,
   requestNovelAIImages,
   requestNovelAIImagesWithRetry,
 } from "../src/ai/media/novelAIProvider.js";
@@ -229,7 +233,7 @@ test("NAI5 低用量的单张文生图安全回退 V4.5", async () => {
   const images = await requestNovelAIImages({
     channel: {
       model: "nai-diffusion-5-full",
-      baseURL: "https://example.test",
+      baseURL: "https://image.novelai.net",
       qualityTags: "masterpiece, no text",
       scale: 7,
       steps: 28,
@@ -435,4 +439,93 @@ test("NAI 参数错误不会重试", async () => {
   );
   assert.equal(calls, 1);
   assert.deepEqual(delays, []);
+});
+
+function bodyResponse(text, { status = 200 } = {}) {
+  const buffer = Buffer.isBuffer(text) ? text : Buffer.from(text);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => String(buffer.length) },
+    body: null,
+    async arrayBuffer() {
+      return toArrayBuffer(buffer);
+    },
+    async text() {
+      return buffer.toString("utf8");
+    },
+  };
+}
+
+test("第三方地址识别与接口路径拼接", () => {
+  assert.equal(isOfficialNovelAIBaseURL("https://image.novelai.net"), true);
+  assert.equal(isOfficialNovelAIBaseURL(""), true);
+  assert.equal(isOfficialNovelAIBaseURL("https://nai.example.test/v1"), false);
+  assert.equal(
+    novelAIGenerationEndpoint("https://nai.example.test/proxy/"),
+    "https://nai.example.test/proxy/ai/generate-image"
+  );
+  assert.equal(
+    novelAIGenerationEndpoint("https://nai.example.test/proxy/ai/generate-image"),
+    "https://nai.example.test/proxy/ai/generate-image"
+  );
+});
+
+test("第三方站点 V5 生图跳过 NovelAI 账户用量查询", async () => {
+  const urls = [];
+  const images = await requestNovelAIImages({
+    channel: {
+      model: "nai-diffusion-5-full",
+      baseURL: "https://nai.example.test",
+    },
+    apiKey: "third-party-key",
+    prompt: "1girl",
+    redisClient: null,
+    fetchImpl: async (url, options) => {
+      urls.push(url);
+      assert.equal(options.headers.Authorization, "Bearer third-party-key");
+      return successImageResponse();
+    },
+    retryDelaysMs: [],
+  });
+  assert.equal(images.length, 1);
+  assert.deepEqual(urls, ["https://nai.example.test/ai/generate-image"]);
+});
+
+test("解析第三方 JSON、data URL、图片链接和 SSE 响应", async () => {
+  const png = extractNovelAIImages(IMAGE_ARCHIVE)[0];
+  const b64 = png.toString("base64");
+
+  const fromJson = await parseNovelAIImageResponse(
+    Buffer.from(JSON.stringify({ data: [{ b64_json: b64 }] }))
+  );
+  assert.deepEqual(fromJson, [png]);
+
+  const fromDataUrl = await parseNovelAIImageResponse(
+    Buffer.from(JSON.stringify({ images: [`data:image/png;base64,${b64}`] }))
+  );
+  assert.deepEqual(fromDataUrl, [png]);
+
+  const downloaded = [];
+  const fromUrl = await parseNovelAIImageResponse(
+    Buffer.from(JSON.stringify({ data: [{ url: "https://cdn.example.test/a.png" }] })),
+    {
+      fetchImpl: async (url) => {
+        downloaded.push(url);
+        return bodyResponse(png);
+      },
+    }
+  );
+  assert.deepEqual(fromUrl, [png]);
+  assert.deepEqual(downloaded, ["https://cdn.example.test/a.png"]);
+
+  const fromSse = await parseNovelAIImageResponse(
+    Buffer.from(`event: final\ndata: {"image":"${b64}"}\n\n`)
+  );
+  assert.deepEqual(fromSse, [png]);
+
+  await assert.rejects(
+    parseNovelAIImageResponse(Buffer.from(JSON.stringify({ error: "额度不足" }))),
+    /没有返回图片数据：额度不足/
+  );
 });

@@ -518,6 +518,145 @@ export function extractNovelAIImages(buffer) {
   return images;
 }
 
+const MAX_JSON_IMAGES = 8;
+const MAX_JSON_DEPTH = 6;
+const BASE64_PATTERN = /^[A-Za-z0-9+/_-]+={0,2}$/;
+
+function decodeBase64Image(value) {
+  const text = String(value || "").trim();
+  const dataUrl = text.match(/^data:image\/[\w.+-]+;base64,(.+)$/is);
+  const payload = (dataUrl ? dataUrl[1] : text).replace(/\s+/g, "");
+  if (payload.length < 64 || !BASE64_PATTERN.test(payload)) return null;
+  const buffer = Buffer.from(payload, "base64");
+  return isImageBuffer(buffer) ? buffer : null;
+}
+
+/**
+ * Collect image payloads from the JSON shapes common NovelAI-compatible
+ * third-party sites return: base64 strings, data URLs, or http(s) links
+ * nested under keys like images / data / b64_json / url.
+ */
+function collectJsonImageCandidates(value, found, depth = 0) {
+  if (found.length >= MAX_JSON_IMAGES || depth > MAX_JSON_DEPTH) return;
+  if (typeof value === "string") {
+    const image = decodeBase64Image(value);
+    if (image) {
+      found.push({ image });
+    } else if (/^https?:\/\/\S+$/i.test(value.trim())) {
+      found.push({ url: value.trim() });
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectJsonImageCandidates(item, found, depth + 1);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) {
+      collectJsonImageCandidates(item, found, depth + 1);
+    }
+  }
+}
+
+function parseJsonOrEventStream(text) {
+  const trimmed = text.trim();
+  if (/^[[{]/.test(trimmed)) {
+    try {
+      return [JSON.parse(trimmed)];
+    } catch {
+      return null;
+    }
+  }
+  if (!/^(?:event|data|id|retry):/m.test(trimmed)) return null;
+  const events = [];
+  for (const line of trimmed.split(/\r?\n/)) {
+    const match = line.match(/^data:\s?(.*)$/);
+    if (!match || !match[1].trim() || match[1].trim() === "[DONE]") continue;
+    try {
+      events.push(JSON.parse(match[1]));
+    } catch {
+      events.push(match[1]);
+    }
+  }
+  return events;
+}
+
+function jsonErrorMessage(values) {
+  for (const value of values) {
+    if (!value || typeof value !== "object") continue;
+    const message =
+      value.error?.message ?? value.error ?? value.message ?? value.detail;
+    if (typeof message === "string" && message.trim()) {
+      return message.trim().slice(0, 300);
+    }
+  }
+  return "";
+}
+
+async function downloadNovelAIImage(url, { fetchImpl, timeoutMs }) {
+  const response = await fetchImpl(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    throw new Error(`下载第三方图片失败：HTTP ${response.status}`);
+  }
+  const buffer = await readResponseCapped(response);
+  if (!isImageBuffer(buffer)) throw new Error("第三方图片链接返回的不是图片");
+  return buffer;
+}
+
+/**
+ * Parse an image-generation response: the official ZIP, a raw image, or the
+ * JSON / SSE bodies used by NovelAI-compatible third-party sites.
+ */
+export async function parseNovelAIImageResponse(
+  buffer,
+  { fetchImpl = globalThis.fetch, timeoutMs = 120_000 } = {}
+) {
+  const body = Buffer.from(buffer || []);
+  if (isImageBuffer(body) || findEndOfCentralDirectory(body) >= 0) {
+    return extractNovelAIImages(body);
+  }
+
+  const values = parseJsonOrEventStream(body.toString("utf8"));
+  if (!values) return extractNovelAIImages(body);
+
+  const candidates = [];
+  for (const value of values) collectJsonImageCandidates(value, candidates);
+  if (candidates.length === 0) {
+    const detail = jsonErrorMessage(values);
+    throw new Error(
+      `NovelAI 接口没有返回图片数据${detail ? `：${detail}` : ""}`
+    );
+  }
+
+  const images = [];
+  let totalBytes = 0;
+  for (const candidate of candidates) {
+    const image =
+      candidate.image ||
+      (await downloadNovelAIImage(candidate.url, { fetchImpl, timeoutMs }));
+    totalBytes += image.length;
+    if (totalBytes > MAX_RESPONSE_BYTES) {
+      throw new Error("NovelAI 返回的图片总体积过大");
+    }
+    images.push(image);
+  }
+  return images;
+}
+
+/** True when the base URL points at NovelAI itself rather than a third-party site. */
+export function isOfficialNovelAIBaseURL(baseURL) {
+  const value = String(baseURL || "").trim();
+  if (!value) return true;
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === "novelai.net" || host.endsWith(".novelai.net");
+  } catch {
+    return false;
+  }
+}
+
 function novelAIServiceRoot(baseURL) {
   return String(baseURL || "https://image.novelai.net")
     .replace(/\/+$/, "")
@@ -799,7 +938,10 @@ async function performNovelAIImageRequest({
     requestError.status = response.status;
     throw requestError;
   }
-  return extractNovelAIImages(await readResponseCapped(response));
+  return parseNovelAIImageResponse(await readResponseCapped(response), {
+    fetchImpl,
+    timeoutMs,
+  });
 }
 
 export async function requestNovelAIImagesWithRetry({
@@ -885,9 +1027,13 @@ async function requestSingleNovelAIImage({
     );
   }
 
+  // Third-party sites bill on their own quota and usually lack
+  // /user/subscription, so the NovelAI account usage guard only applies to
+  // the official API.
   if (
     getNovelAIModelProfile(useModel).family === "v5" &&
-    channel.checkV5Usage !== false
+    channel.checkV5Usage !== false &&
+    isOfficialNovelAIBaseURL(channel.baseURL)
   ) {
     try {
       await checkNovelAIUsageLimit(apiKey, {

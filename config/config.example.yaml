@@ -98,8 +98,11 @@ ai:
   novelAI:
     enabled: true
     model: nai-diffusion-5-full
+    # 可替换为兼容 NovelAI 接口的第三方站点，例如 https://example.com 或
+    # https://example.com/ai/generate-image；api 填该站点的 Key（Bearer 发送）。
     baseURL: https://image.novelai.net
     api: '请直接填写 NovelAI Token'
+    # 仅对官方 novelai.net 生效，第三方站点自动跳过。
     checkV5Usage: true
     negative: nsfw, lowres, artistic error, scan artifacts, worst quality, bad quality, jpeg artifacts, multiple views, very displeasing, too many watermarks, negative space, blank page
     qualityTags: very aesthetic, masterpiece, no text
